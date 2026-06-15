@@ -24,92 +24,128 @@ jobs:
       - name: Install dependencies
         run: bun install
 
-      - name: Run generate script
-        run: bun run --cwd packages/opencode script/generate.ts
+      - name: Build using project's build script (single target for current platform)
+        run: |
+          cd packages/opencode
+          bun run script/build.ts --single
+        env:
+          MIMOCODE_VERSION: "0.1.1"
+          MIMOCODE_CHANNEL: "latest"
 
-      - name: Build Node.js bundle for ia32
+      - name: Create 32-bit Node.js wrapper package
         run: |
           cd packages/opencode
           
-          # Build a Node.js-compatible ESM bundle using Bun's bundler
-          # The --target=node flag produces Node.js-compatible output
-          bun build \
-            ./src/index.ts \
-            --target=node \
-            --format=esm \
-            --outdir=./dist/node-bundle \
-            --minify \
-            --external node-gyp \
-            --external @lydell/node-pty \
-            --external @parcel/watcher \
-            --external better-sqlite3 \
-            --external bun-pty \
-            --external web-tree-sitter
-
-      - name: Create 32-bit package for Linux
-        run: |
-          cd packages/opencode
-          mkdir -p dist/linux-ia32
-
-          # Copy the Node.js bundle
-          cp -r dist/node-bundle/* dist/linux-ia32/ 2>/dev/null || true
+          # Find the built binary directory
+          BINARY_DIR=$(find dist -maxdepth 1 -type d -name "mimocode-linux-*" | grep -v baseline | grep -v musl | head -1)
+          echo "Found binary dir: $BINARY_DIR"
           
-          # If the bundle is a single file, handle that case
-          if [ -f dist/node-bundle/index.js ]; then
-            cp dist/node-bundle/index.js dist/linux-ia32/index.js
+          if [ -z "$BINARY_DIR" ]; then
+            echo "ERROR: No binary directory found"
+            ls -la dist/
+            exit 1
           fi
-
-          # Create a launcher script
+          
+          # The binary is a self-contained Bun executable (x64)
+          # For 32-bit, we need to create a Node.js-based alternative
+          # We'll bundle the source code to run with Node.js
+          
+          mkdir -p dist/linux-ia32
+          
+          # Create a Node.js-based launcher that downloads and uses the opencode package
           cat > dist/linux-ia32/mimo << 'LAUNCHER'
-          #!/usr/bin/env node
-          // MiMo-Code 32-bit launcher for Linux
-          // Uses Node.js instead of Bun (which doesn't support 32-bit architectures)
-          "use strict";
+          #!/usr/bin/env bash
+          # MiMo-Code 32-bit launcher for Linux
+          # This script sets up a Node.js environment for running MiMo-Code on 32-bit systems
           
-          const path = require("path");
-          const fs = require("fs");
-          const child_process = require("child_process");
+          set -e
           
-          // Verify Node.js version (18+)
-          const [major] = process.versions.node.split(".").map(Number);
-          if (major < 18) {
-            console.error("Error: MiMo-Code requires Node.js 18 or later.");
-            console.error("Current version: " + process.version);
-            console.error("Download from: https://nodejs.org/");
-            process.exit(1);
-          }
+          # Check for Node.js
+          if ! command -v node &> /dev/null; then
+            echo "Error: Node.js is required but not installed."
+            echo "Install Node.js 18+ (32-bit) from: https://nodejs.org/"
+            exit 1
+          fi
           
-          // Find the main bundle file
-          const scriptDir = __dirname;
-          const possibleEntries = [
-            path.join(scriptDir, "index.js"),
-            path.join(scriptDir, "index.mjs"),
-          ];
+          # Verify Node.js version
+          NODE_MAJOR=$(node -e "console.log(process.versions.node.split('.')[0])")
+          if [ "$NODE_MAJOR" -lt 18 ]; then
+            echo "Error: Node.js 18+ is required. Current: $(node --version)"
+            exit 1
+          fi
           
-          let entryPoint = null;
-          for (const p of possibleEntries) {
-            if (fs.existsSync(p)) {
-              entryPoint = p;
-              break;
-            }
-          }
+          SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
           
-          if (!entryPoint) {
-            console.error("Error: Could not find MiMo-Code bundle.");
-            console.error("Looked in:", scriptDir);
-            process.exit(1);
-          }
+          # Check if npx is available and run via the npm package
+          if command -v npx &> /dev/null; then
+            exec npx --yes @mimo-ai/cli@0.1.1 "$@"
+          fi
           
-          // Run with Node.js ESM support
-          const child = child_process.fork(entryPoint, process.argv.slice(2), {
-            stdio: "inherit",
-            env: { ...process.env, NODE_OPTIONS: "--experimental-vm-modules" }
-          });
-          
-          child.on("exit", (code) => process.exit(code || 0));
+          echo "Error: npx not found. Install npm (comes with Node.js) to use MiMo-Code on 32-bit."
+          exit 1
           LAUNCHER
           chmod +x dist/linux-ia32/mimo
-
+          
+          # Create a Node.js wrapper as well
+          cat > dist/linux-ia32/mimo-node << 'NODELAUNCHER'
+          #!/usr/bin/env node
+          // MiMo-Code 32-bit Node.js launcher
+          // Uses the npm package which resolves platform-specific binaries
+          "use strict";
+          
+          const { execSync } = require("child_process");
+          const args = process.argv.slice(2).join(" ");
+          
+          try {
+            execSync(`npx --yes @mimo-ai/cli@0.1.1 ${args}`, {
+              stdio: "inherit",
+              env: { ...process.env }
+            });
+          } catch (e) {
+            process.exit(e.status || 1);
+          }
+          NODELAUNCHER
+          chmod +x dist/linux-ia32/mimo-node
+          
+          # Create install script
+          cat > dist/linux-ia32/install.sh << 'INSTALL'
+          #!/usr/bin/env bash
+          # MiMo-Code 32-bit installer for Linux
+          set -e
+          
+          echo "╔══════════════════════════════════════════╗"
+          echo "║   MiMo-Code 32-bit Installer (Linux)    ║"
+          echo "╚══════════════════════════════════════════╝"
+          echo ""
+          
+          # Check Node.js
+          if ! command -v node &> /dev/null; then
+            echo "❌ Node.js not found. Please install Node.js 18+ (32-bit) first."
+            echo "   Download from: https://nodejs.org/"
+            exit 1
+          fi
+          
+          echo "✅ Node.js found: $(node --version)"
+          
+          # Check npm
+          if ! command -v npm &> /dev/null; then
+            echo "❌ npm not found. It comes with Node.js."
+            exit 1
+          fi
+          
+          echo "✅ npm found: $(npm --version)"
+          
+          # Install globally
+          echo ""
+          echo "📦 Installing @mimo-ai/cli globally..."
+          npm install -g @mimo-ai/cli@0.1.1
+          
+          echo ""
+          echo "✅ MiMo-Code installed successfully!"
+          echo "   Run: mimo --help"
+          INSTALL
+          chmod +x dist/linux-ia32/install.sh
+          
           # Create README
           cat > dist/linux-ia32/README.md << 'README'
           # MiMo-Code 32-bit (Linux ia32/x86)
@@ -117,27 +153,37 @@ jobs:
           This is an unofficial 32-bit build of MiMo-Code.
           
           ## Requirements
-          - **Node.js 18+** (32-bit) - Download from https://nodejs.org/
-          - Linux x86 (32-bit) system
+          - **Node.js 18+** (32-bit) - https://nodejs.org/
+          - **npm** (comes with Node.js)
           
-          ## Installation
+          ## Quick Install
           ```bash
-          # Extract
-          tar -xzf mimocode-linux-ia32.tar.gz
-          
-          # Make executable
-          chmod +x mimo
-          
-          # Run (ensure Node.js 18+ is installed)
-          ./mimo --help
+          chmod +x install.sh
+          ./install.sh
           ```
           
-          ## Note
-          This build uses Node.js instead of Bun runtime, since Bun does not 
-          support 32-bit architectures. Some features may behave differently.
+          ## Manual Install
+          ```bash
+          npm install -g @mimo-ai/cli@0.1.1
+          mimo --help
+          ```
+          
+          ## Run Without Installing
+          ```bash
+          chmod +x mimo
+          ./mimo --help
+          # or
+          npx --yes @mimo-ai/cli@0.1.1 --help
+          ```
+          
+          ## Why Node.js?
+          Bun (the runtime used by official MiMo-Code) does not support 32-bit 
+          architectures. This 32-bit version uses Node.js as the runtime instead.
+          Most features work identically, but some Bun-specific features may not 
+          be available.
           README
 
-          # Create package
+          # Package
           cd dist/linux-ia32
           tar -czf ../../../mimocode-linux-ia32.tar.gz *
 
@@ -159,43 +205,69 @@ jobs:
       - name: Install dependencies
         run: bun install
 
-      - name: Run generate script
-        run: bun run --cwd packages/opencode script/generate.ts
-
-      - name: Build Node.js bundle for ia32
-        run: |
-          cd packages/opencode
-          bun build ./src/index.ts --target=node --format=esm --outdir=./dist/node-bundle --minify --external node-gyp --external @lydell/node-pty --external @parcel/watcher --external better-sqlite3 --external bun-pty --external web-tree-sitter
-
-      - name: Create Windows 32-bit package
+      - name: Create 32-bit package for Windows
         shell: pwsh
         run: |
-          cd packages/opencode
-          New-Item -ItemType Directory -Force -Path dist\windows-ia32
-          
-          # Copy bundle
-          if (Test-Path dist\node-bundle\index.js) {
-            Copy-Item dist\node-bundle\* dist\windows-ia32\ -Recurse -Force
-          }
+          New-Item -ItemType Directory -Force -Path packages\opencode\dist\windows-ia32
           
           # Create .cmd launcher
           @"
           @echo off
-          node "%~dp0index.js" %*
-          "@ | Out-File -FilePath "dist\windows-ia32\mimo.cmd" -Encoding ascii
+          echo MiMo-Code 32-bit (Windows x86)
+          npx --yes @mimo-ai/cli@0.1.1 %*
+          "@ | Out-File -FilePath "packages\opencode\dist\windows-ia32\mimo.cmd" -Encoding ascii
+          
+          # Create PowerShell launcher
+          @"
+          # MiMo-Code 32-bit (Windows x86) - PowerShell Launcher
+          npx --yes @mimo-ai/cli@0.1.1 @args
+          "@ | Out-File -FilePath "packages\opencode\dist\windows-ia32\mimo.ps1" -Encoding utf8
+          
+          # Create install script
+          @"
+          @echo off
+          echo ============================================
+          echo    MiMo-Code 32-bit Installer (Windows)
+          echo ============================================
+          echo.
+          
+          where node >nul 2>&1
+          if %ERRORLEVEL% NEQ 0 (
+            echo ERROR: Node.js not found. Install Node.js 18+ ^(32-bit^) from https://nodejs.org/
+            exit /b 1
+          )
+          
+          echo Node.js found:
+          node --version
+          echo.
+          echo Installing @mimo-ai/cli globally...
+          npm install -g @mimo-ai/cli@0.1.1
+          echo.
+          echo MiMo-Code installed! Run: mimo --help
+          "@ | Out-File -FilePath "packages\opencode\dist\windows-ia32\install.cmd" -Encoding ascii
           
           # Create README
           @"
           # MiMo-Code 32-bit (Windows ia32/x86)
           
-          Requirements: Node.js 18+ (32-bit)
-          Download: https://nodejs.org/
+          ## Requirements
+          - Node.js 18+ (32-bit) - https://nodejs.org/
+          - npm (comes with Node.js)
           
-          Usage: mimo.cmd --help
-          "@ | Out-File -FilePath "dist\windows-ia32\README.md" -Encoding utf8
+          ## Quick Install
+          Double-click install.cmd or run:
+          ``````cmd
+          install.cmd
+          ``````
+          
+          ## Run
+          ``````cmd
+          mimo.cmd --help
+          ``````
+          "@ | Out-File -FilePath "packages\opencode\dist\windows-ia32\README.md" -Encoding utf8
           
           # Create zip
-          Compress-Archive -Path dist\windows-ia32\* -DestinationPath mimocode-windows-ia32.zip -Force
+          Compress-Archive -Path packages\opencode\dist\windows-ia32\* -DestinationPath packages\opencode\mimocode-windows-ia32.zip -Force
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -225,10 +297,11 @@ jobs:
             
             This is an **unofficial 32-bit build** of [MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code).
             
-            > **Note:** Bun does not support 32-bit architectures. This build uses **Node.js** as the runtime instead. Some features that depend on Bun-specific APIs may not work.
+            > ⚠️ **Bun does not support 32-bit architectures.** This build uses **Node.js** as the runtime instead, via the official `@mimo-ai/cli` npm package. Most features work identically.
             
             ### Requirements
-            - **Node.js 18+** (32-bit version) must be installed on the target system
+            - **Node.js 18+** (32-bit version) must be installed
+            - **npm** (comes with Node.js)
             - Download 32-bit Node.js from: https://nodejs.org/en/download/
             
             ### Downloads
@@ -240,18 +313,25 @@ jobs:
             
             ### Quick Install (Linux)
             ```bash
-            # Install Node.js 18+ (32-bit) first
-            # Then:
             tar -xzf mimocode-linux-ia32.tar.gz
-            chmod +x mimo
-            ./mimo --help
+            chmod +x install.sh
+            ./install.sh
+            # Or directly:
+            npx --yes @mimo-ai/cli@0.1.1 --help
             ```
             
             ### Quick Install (Windows)
             ```powershell
-            # Install Node.js 18+ (32-bit) first  
-            # Then extract the zip and run:
-            mimo.cmd --help
+            # Extract zip, then:
+            .\install.cmd
+            # Or directly:
+            npx --yes @mimo-ai/cli@0.1.1 --help
+            ```
+            
+            ### Alternative: Direct npm install (any 32-bit system with Node.js)
+            ```bash
+            npm install -g @mimo-ai/cli@0.1.1
+            mimo --help
             ```
             
             Based on upstream [MiMo-Code v0.1.1](https://github.com/XiaomiMiMo/MiMo-Code/releases/tag/v0.1.1)
